@@ -39,7 +39,6 @@ import zmq
 
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runtime
 from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
@@ -125,6 +124,10 @@ class EventPublisher(ABC):
         """Enqueue an event batch without blocking the scheduler."""
 
     @abstractmethod
+    def publish_serialized(self, payload: bytes) -> bool:
+        """Enqueue a complete MessagePack event batch without re-encoding it."""
+
+    @abstractmethod
     def shutdown(self) -> None:
         """Flush pending batches and stop the publisher."""
 
@@ -133,6 +136,9 @@ class NullEventPublisher(EventPublisher):
     """Drains event batches locally without external I/O."""
 
     def publish(self, events: EventBatch) -> bool:
+        return True
+
+    def publish_serialized(self, payload: bytes) -> bool:
         return True
 
     def shutdown(self) -> None:
@@ -162,7 +168,7 @@ class ZmqEventPublisher(EventPublisher):
         topic: str = "",
     ) -> None:
         super().__init__(data_parallel_rank)
-        self._event_queue = Queue[Optional[tuple[int, EventBatch]]](maxsize=max_queue_size)
+        self._event_queue = Queue[Optional[tuple[int, EventBatch | bytes]]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
@@ -217,16 +223,22 @@ class ZmqEventPublisher(EventPublisher):
         return self._queue_full_drops + self._send_error_drops
 
     def publish(self, events: EventBatch) -> bool:
-        if not self._running:
-            return False
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
+        return self._enqueue(events)
+
+    def publish_serialized(self, payload: bytes) -> bool:
+        return self._enqueue(payload)
+
+    def _enqueue(self, event: EventBatch | bytes) -> bool:
+        if not self._running:
+            return False
         # Reserve the sequence number here rather than in the publisher thread, so a
         # batch lost to a full queue or a failed send leaves a detectable gap instead of
-        # a contiguous stream that hides the loss. publish() is the only allocator.
+        # a contiguous stream that hides the loss. _enqueue() is the only allocator.
         seq = next(self._seq_gen)
         try:
-            self._event_queue.put_nowait((seq, events))
+            self._event_queue.put_nowait((seq, event))
             self.enqueued_batches += 1
             return True
         except queue.Full:
@@ -303,7 +315,7 @@ class ZmqEventPublisher(EventPublisher):
                     break
                 seq, event = item
                 try:
-                    payload = encoder.encode(event)
+                    payload = event if isinstance(event, bytes) else encoder.encode(event)
                     self._pub.send_multipart(
                         (
                             self._topic_bytes,
@@ -511,9 +523,9 @@ class StreamingKVCacheEventManager:
 
     With the Python KV-cache backend this object is the duck-typed event sink. With
     the C++ backend, ``native_event_sink`` captures the same semantics without a
-    Python callback on the cache hot path, and this facade drains its DTOs at the
+    Python callback on the cache hot path and returns one serialized batch at the
     once-per-iteration flush boundary. Both modes share publisher lifecycle,
-    batching, counters, and wire structs here.
+    counters, queueing, and transport here.
     """
 
     def __init__(
@@ -756,7 +768,15 @@ class StreamingKVCacheEventManager:
         if self._closed:
             return
         if self._native_event_sink is not None:
-            events = self._drain_native_events()
+            native_batch = self._native_event_sink.drain_serialized_iteration(
+                time.time(), self._rank
+            )
+            self._sync_native_stats()
+            if native_batch is None:
+                return
+            payload, event_count = native_batch
+            self._publish_serialized_iteration(payload, event_count)
+            return
         else:
             if not self._pending_events:
                 return
@@ -783,35 +803,24 @@ class StreamingKVCacheEventManager:
                 f"{traceback.format_exc()}"
             )
 
+    def _publish_serialized_iteration(self, payload: bytes, event_count: int) -> None:
+        try:
+            if self._publisher.publish_serialized(payload):
+                self.enqueued_batches += 1
+                self.enqueued_events += event_count
+            else:
+                self.dropped_batches += 1
+        except Exception:
+            self.dropped_batches += 1
+            logger.error(
+                f"Dropping serialized streaming KV event iteration batch on rank={self._rank}\n"
+                f"{traceback.format_exc()}"
+            )
+
     @property
     def event_sink(self) -> object:
         """Return the backend-specific sink installed in KVCacheManager."""
         return self if self._native_event_sink is None else self._native_event_sink
-
-    def _drain_native_events(
-        self,
-    ) -> list[BlockStored | BlockRemoved | AllBlocksCleared]:
-        assert self._native_event_sink is not None
-        result: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
-        for event in self._native_event_sink.drain_iteration_events():
-            if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
-                result.append(
-                    BlockStored(
-                        block_hashes=list(event.block_hashes),
-                        parent_block_hash=event.parent_block_hash,
-                        token_ids=list(event.token_ids),
-                        block_size=self._block_size,
-                        lora_id=None,
-                        medium="GPU",
-                        lora_name=None,
-                    )
-                )
-            elif isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockRemovedData):
-                result.append(BlockRemoved(block_hashes=list(event.block_hashes), medium="GPU"))
-            else:
-                raise TypeError(f"Unsupported native streaming KV event: {type(event)!r}")
-        self._sync_native_stats()
-        return result
 
     def _sync_native_stats(self) -> None:
         if self._native_event_sink is None:

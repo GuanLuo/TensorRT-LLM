@@ -21,6 +21,7 @@ import time
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
+import msgspec
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_events import StreamingKVCacheEventManager
@@ -286,8 +287,10 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
     manager.start()
     try:
         manager.set_layer_group_window_sizes({0: 128, 1: 64})
-        published = []
-        manager._publisher.publish = lambda batch: published.append(batch) or True
+        published_payloads = []
+        manager._publisher.publish_serialized = (
+            lambda payload: published_payloads.append(payload) or True
+        )
         make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
 
         first = make_block(_token_ids(1, 3), [2, 2])
@@ -302,22 +305,31 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory):
 
         first_hash = int.from_bytes(_block_key(first)[:8], byteorder="big", signed=True)
         second_hash = int.from_bytes(_block_key(second)[:8], byteorder="big", signed=True)
-        assert len(published) == 1
-        stored = published[0].events
+        assert len(published_payloads) == 1
+        stored_batch = msgspec.msgpack.decode(published_payloads[0])
+        assert stored_batch[2] == 0
+        stored = stored_batch[1]
         assert len(stored) == 1
-        assert stored[0].block_hashes == [first_hash, second_hash]
-        assert stored[0].parent_block_hash is None
-        assert stored[0].token_ids == [1, 2, 3, 4]
+        assert stored[0]["type"] == "BlockStored"
+        assert stored[0]["block_hashes"] == [first_hash, second_hash]
+        assert stored[0]["parent_block_hash"] is None
+        assert stored[0]["token_ids"] == [1, 2, 3, 4]
+        assert stored[0]["block_size"] == 2
+        assert stored[0]["medium"] == "GPU"
 
         _add_streaming_removed_life_cycle(event_sink, second, 1)
         _add_streaming_removed_block(event_sink, first)
         _add_streaming_removed_life_cycle(event_sink, second, 0)
         manager.flush_iteration_events()
 
-        assert len(published) == 2
-        removed = published[1].events
+        assert len(published_payloads) == 2
+        removed = msgspec.msgpack.decode(published_payloads[1])[1]
         assert len(removed) == 1
-        assert removed[0].block_hashes == [first_hash, second_hash]
+        assert removed[0] == {
+            "type": "BlockRemoved",
+            "block_hashes": [first_hash, second_hash],
+            "medium": "GPU",
+        }
         assert manager.stored_blocks == 2
         assert manager.removed_blocks == 2
         assert manager.partial_blocks_suppressed == 1

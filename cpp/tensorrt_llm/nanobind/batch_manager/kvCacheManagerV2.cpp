@@ -1077,6 +1077,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>())
         .def("drain_iteration_events", &kv::StreamingEventSink::drainIterationEvents,
             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "drain_serialized_iteration",
+            [](kv::StreamingEventSink& self, double timestamp, int dataParallelRank) -> nb::object
+            {
+                std::optional<kv::StreamingSerializedBatch> batch;
+                {
+                    nb::gil_scoped_release release;
+                    batch = self.drainSerializedIteration(timestamp, dataParallelRank);
+                }
+                if (!batch.has_value())
+                {
+                    return nb::none();
+                }
+                return nb::make_tuple(
+                    nb::bytes(reinterpret_cast<char const*>(batch->payload.data()), batch->payload.size()),
+                    batch->eventCount);
+            },
+            nb::arg("timestamp"), nb::arg("data_parallel_rank"))
         .def_prop_ro("stats", &kv::StreamingEventSink::getStats, nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<kv::EventManager, kv::EventSink>(m, "KVCacheEventManager")

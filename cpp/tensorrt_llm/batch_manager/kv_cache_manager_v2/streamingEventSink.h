@@ -19,6 +19,7 @@
 
 #include "kv_cache_manager_v2/eventSink.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -56,6 +57,13 @@ struct StreamingEventStats
     int64_t droppedEvents = 0;
 };
 
+//! A complete MessagePack wire payload and its number of logical events.
+struct StreamingSerializedBatch
+{
+    std::vector<uint8_t> payload;
+    size_t eventCount = 0;
+};
+
 //! Captures streaming KV-cache lifecycle events without depending on Python or a transport.
 class StreamingEventSink final : public EventSink
 {
@@ -64,6 +72,8 @@ public:
 
     void setTargetLifeCycle(LifeCycleId lifeCycle);
     [[nodiscard]] std::vector<StreamingEventData> drainIterationEvents();
+    [[nodiscard]] std::optional<StreamingSerializedBatch> drainSerializedIteration(
+        double timestamp, int dataParallelRank);
     [[nodiscard]] StreamingEventStats getStats() const;
 
     void addStoredBlock(Block const& block) override;

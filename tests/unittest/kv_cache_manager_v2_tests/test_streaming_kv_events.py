@@ -283,6 +283,33 @@ def test_dropped_batches_leave_a_sequence_gap() -> None:
         publisher.shutdown()
 
 
+def test_serialized_payload_is_published_without_reencoding() -> None:
+    """The native MessagePack batch must cross Python and ZeroMQ byte-for-byte."""
+    context = zmq.Context.instance()
+    payload = msgspec.msgpack.encode([1.25, [{"type": "BlockRemoved"}], 3])
+
+    def scenario(port: int) -> None:
+        endpoint = f"tcp://*:{port}"
+        subscriber = context.socket(zmq.SUB)
+        subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+        subscriber.connect(f"tcp://127.0.0.1:{port}")
+        publisher = ZmqEventPublisher(data_parallel_rank=0, endpoint=endpoint)
+        try:
+            publisher.start()
+            base_seq = _await_subscription(publisher, subscriber)
+            assert publisher.publish_serialized(payload)
+            if not subscriber.poll(_RECEIVE_TIMEOUT_MS):
+                raise _NotReceived(port)
+            frames = subscriber.recv_multipart()
+            assert int.from_bytes(frames[1], "big") == base_seq
+            assert frames[2] == payload
+        finally:
+            publisher.shutdown()
+            subscriber.close(linger=0)
+
+    _run_on_fresh_port(scenario)
+
+
 def test_construction_binds_nothing_until_start() -> None:
     """A constructed-but-unstarted publisher must hold no socket and no thread."""
     port = _unused_tcp_port()

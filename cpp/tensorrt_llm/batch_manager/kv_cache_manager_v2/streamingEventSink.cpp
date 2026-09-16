@@ -23,12 +23,197 @@
 
 #include <cinttypes>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+
+class MessagePackWriter
+{
+public:
+    void packArraySize(size_t size)
+    {
+        if (size <= 15)
+        {
+            mPayload.push_back(static_cast<uint8_t>(0x90U | size));
+        }
+        else if (size <= std::numeric_limits<uint16_t>::max())
+        {
+            mPayload.push_back(0xDCU);
+            packBigEndian(static_cast<uint16_t>(size));
+        }
+        else
+        {
+            if (size > std::numeric_limits<uint32_t>::max())
+            {
+                throw std::overflow_error("MessagePack array is too large");
+            }
+            mPayload.push_back(0xDDU);
+            packBigEndian(static_cast<uint32_t>(size));
+        }
+    }
+
+    void packMapSize(size_t size)
+    {
+        if (size <= 15)
+        {
+            mPayload.push_back(static_cast<uint8_t>(0x80U | size));
+            return;
+        }
+        throw std::overflow_error("Streaming event map is too large");
+    }
+
+    void packString(std::string_view value)
+    {
+        if (value.size() <= 31)
+        {
+            mPayload.push_back(static_cast<uint8_t>(0xA0U | value.size()));
+        }
+        else if (value.size() <= std::numeric_limits<uint8_t>::max())
+        {
+            mPayload.push_back(0xD9U);
+            mPayload.push_back(static_cast<uint8_t>(value.size()));
+        }
+        else
+        {
+            throw std::overflow_error("Streaming event string is too large");
+        }
+        mPayload.insert(mPayload.end(), value.begin(), value.end());
+    }
+
+    void packInt(int64_t value)
+    {
+        mPayload.push_back(0xD3U);
+        packBigEndian(static_cast<uint64_t>(value));
+    }
+
+    void packDouble(double value)
+    {
+        static_assert(sizeof(value) == sizeof(uint64_t));
+        uint64_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        mPayload.push_back(0xCBU);
+        packBigEndian(bits);
+    }
+
+    void packNil()
+    {
+        mPayload.push_back(0xC0U);
+    }
+
+    [[nodiscard]] std::vector<uint8_t> takePayload()
+    {
+        return std::move(mPayload);
+    }
+
+private:
+    template <typename T>
+    void packBigEndian(T value)
+    {
+        static_assert(std::is_unsigned_v<T>);
+        for (size_t shift = sizeof(T); shift > 0; --shift)
+        {
+            mPayload.push_back(static_cast<uint8_t>(value >> ((shift - 1) * 8U)));
+        }
+    }
+
+    std::vector<uint8_t> mPayload;
+};
+
+void packIntArray(MessagePackWriter& writer, std::vector<int64_t> const& values)
+{
+    writer.packArraySize(values.size());
+    for (int64_t value : values)
+    {
+        writer.packInt(value);
+    }
+}
+
+void packTokenArray(MessagePackWriter& writer, std::vector<TokenId> const& values)
+{
+    writer.packArraySize(values.size());
+    for (TokenId value : values)
+    {
+        writer.packInt(value);
+    }
+}
+
+void packStoredEvent(MessagePackWriter& writer, StreamingBlockStoredData const& event, int blockSize)
+{
+    writer.packMapSize(8);
+    writer.packString("type");
+    writer.packString("BlockStored");
+    writer.packString("block_hashes");
+    packIntArray(writer, event.blockHashes);
+    writer.packString("parent_block_hash");
+    if (event.parentBlockHash.has_value())
+    {
+        writer.packInt(*event.parentBlockHash);
+    }
+    else
+    {
+        writer.packNil();
+    }
+    writer.packString("token_ids");
+    packTokenArray(writer, event.tokenIds);
+    writer.packString("block_size");
+    writer.packInt(blockSize);
+    writer.packString("lora_id");
+    writer.packNil();
+    writer.packString("medium");
+    writer.packString("GPU");
+    writer.packString("lora_name");
+    writer.packNil();
+}
+
+void packRemovedEvent(MessagePackWriter& writer, StreamingBlockRemovedData const& event)
+{
+    writer.packMapSize(3);
+    writer.packString("type");
+    writer.packString("BlockRemoved");
+    writer.packString("block_hashes");
+    packIntArray(writer, event.blockHashes);
+    writer.packString("medium");
+    writer.packString("GPU");
+}
+
+StreamingSerializedBatch serializeBatch(
+    std::vector<StreamingEventData> const& events, int blockSize, double timestamp, int dataParallelRank)
+{
+    MessagePackWriter writer;
+    writer.packArraySize(3);
+    writer.packDouble(timestamp);
+    writer.packArraySize(events.size());
+    for (auto const& event : events)
+    {
+        std::visit(
+            [&writer, blockSize](auto const& data)
+            {
+                using T = std::decay_t<decltype(data)>;
+                if constexpr (std::is_same_v<T, StreamingBlockStoredData>)
+                {
+                    packStoredEvent(writer, data, blockSize);
+                }
+                else
+                {
+                    packRemovedEvent(writer, data);
+                }
+            },
+            event);
+    }
+    writer.packInt(dataParallelRank);
+    return StreamingSerializedBatch{writer.takePayload(), events.size()};
+}
+
+} // namespace
 
 StreamingEventSink::StreamingEventSink(int tokensPerBlock, int maxEntries)
     : mTokensPerBlock(tokensPerBlock)
@@ -57,6 +242,17 @@ std::vector<StreamingEventData> StreamingEventSink::drainIterationEvents()
     mPendingEvents.clear();
     mPendingEntries = 0;
     return events;
+}
+
+std::optional<StreamingSerializedBatch> StreamingEventSink::drainSerializedIteration(
+    double timestamp, int dataParallelRank)
+{
+    auto events = drainIterationEvents();
+    if (events.empty())
+    {
+        return std::nullopt;
+    }
+    return serializeBatch(events, mTokensPerBlock, timestamp, dataParallelRank);
 }
 
 StreamingEventStats StreamingEventSink::getStats() const
